@@ -6,20 +6,21 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rtcm_msgs REQUIRED)
+find_package(ublox_ubx_msgs REQUIRED)
 
 include_directories(include)
 
 # --- BASE ---
 add_executable(base_node src/base_node.cpp src/ublox_i2c_handler.cpp)
-ament_target_dependencies(base_node rclcpp sensor_msgs std_msgs)
+ament_target_dependencies(base_node rclcpp sensor_msgs std_msgs ublox_ubx_msgs)
 
 # --- ROVER ---
 add_executable(rover_node src/rover_node.cpp)
-ament_target_dependencies(rover_node rclcpp sensor_msgs std_msgs)
+ament_target_dependencies(rover_node rclcpp sensor_msgs std_msgs ublox_ubx_msgs)
 
 # --- MANAGER ---
 add_executable(i2c_manager_node src/i2c_manager_node.cpp src/ublox_i2c_handler.cpp)
-ament_target_dependencies(i2c_manager_node rclcpp rtcm_msgs)
+ament_target_dependencies(i2c_manager_node rclcpp rtcm_msgs sensor_msgs ublox_ubx_msgs)
 
 # --- INSTALL BINARIES ---
 install(TARGETS 

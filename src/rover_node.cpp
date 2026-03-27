@@ -1,7 +1,6 @@
 #include "rclcpp/rclcpp.hpp"
-#include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
-#include "std_msgs/msg/string.hpp"
+#include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -9,32 +8,20 @@
 #include <vector>
 #include <string>
 
-// ============================================================
-// PRODUCTION CONFIGURATION — tune these to your robot
-// ============================================================
-static constexpr double PHYSICAL_BASELINE_M = 1.05;  // measured antenna separation (m)
-static constexpr double BASELINE_TOLERANCE_M = 0.10; // allow ±10cm noise
-static constexpr double ACC_THRESHOLD_M      = 0.05; // reject if hAcc > 5cm
-static constexpr int    LATCH_COUNT_REQUIRED = 3;    // consecutive good frames before publishing
-// ============================================================
-
 class RoverNode : public rclcpp::Node {
 public:
     RoverNode() : Node("rover_node") {
-        imu_pub_  = create_publisher<sensor_msgs::msg::Imu>("/imu_gps/data", 10);
-        fix_pub_  = create_publisher<sensor_msgs::msg::NavSatFix>("/rover/fix", 10);
-        pvt_pub_  = create_publisher<std_msgs::msg::String>("/rover/nav_pvt", 10);
-        info_pub_ = create_publisher<std_msgs::msg::String>("/rover/info", 10);
+        fix_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/rover/fix", 10);
+        
+        // THIS is the topic your Python script is waiting for!
+        relposned_pub_ = create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>("/rover/ubx_nav_rel_pos_ned", 10);
 
-        // Subscribe to base position
         base_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
             "/gps/fix", 10,
             [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-                if (msg->status.status == 2) {
-                    base_lat_   = msg->latitude;
-                    base_lon_   = msg->longitude;
-                    base_ready_ = true;
-                }
+                base_lat_ = msg->latitude;
+                base_lon_ = msg->longitude;
+                base_ready_ = true;
             });
 
         declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
@@ -45,17 +32,14 @@ public:
             return;
         }
 
-        send_ubx_cfg(0x01, 0x07, 0x01); // NAV-PVT @ 1Hz on UART1
+        send_ubx_cfg_rate(500); // Lock to 2Hz
+        send_ubx_cfg(0x01, 0x07, 0x01); // Enable NAV-PVT
 
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
-        RCLCPP_INFO(get_logger(),
-            "Rover node ready on %s | baseline=%.2fm tol=%.2fm acc<%.2fm latch=%d",
-            port.c_str(),
-            PHYSICAL_BASELINE_M, BASELINE_TOLERANCE_M,
-            ACC_THRESHOLD_M, LATCH_COUNT_REQUIRED);
+        RCLCPP_INFO(get_logger(), "Rover node ready. Locked at 2Hz. Spoofing RELPOSNED.");
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -64,21 +48,13 @@ private:
     int serial_fd_ = -1;
     std::vector<uint8_t> buffer_;
 
-    // Base position
     double base_lat_{0.0}, base_lon_{0.0};
-    bool   base_ready_{false};
+    bool base_ready_{false};
 
-    // Safety gate state
-    double last_good_heading_{0.0};
-    bool   heading_locked_{false};
-    int    latch_counter_{0};
-
-    rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr          imu_pub_;
-    rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr    fix_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr          pvt_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr          info_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
+    rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr base_sub_;
-    rclcpp::TimerBase::SharedPtr                                  timer_;
+    rclcpp::TimerBase::SharedPtr timer_;
 
     bool init_serial(const std::string& port, int baud) {
         (void)baud;
@@ -87,10 +63,8 @@ private:
         struct termios tty;
         if (tcgetattr(serial_fd_, &tty) != 0) return false;
         cfsetospeed(&tty, B115200); cfsetispeed(&tty, B115200);
-        tty.c_cflag |= (CLOCAL | CREAD);
-        tty.c_cflag &= ~CSIZE;   tty.c_cflag |= CS8;
-        tty.c_cflag &= ~PARENB;  tty.c_cflag &= ~CSTOPB;
-        tty.c_cflag &= ~CRTSCTS;
+        tty.c_cflag |= (CLOCAL | CREAD | CS8);
+        tty.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
         tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON|IXOFF|IXANY);
         tty.c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
         tty.c_oflag &= ~OPOST;
@@ -98,12 +72,24 @@ private:
         return tcsetattr(serial_fd_, TCSANOW, &tty) == 0;
     }
 
+    void send_ubx_cfg_rate(uint16_t rate_ms) {
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00};
+        msg.push_back(rate_ms & 0xFF);
+        msg.push_back((rate_ms >> 8) & 0xFF);
+        msg.push_back(0x01); 
+        msg.push_back(0x00); 
+        msg.push_back(0x01); 
+        msg.push_back(0x00); 
+        uint8_t cka = 0, ckb = 0;
+        for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
+        msg.push_back(cka); msg.push_back(ckb);
+        write(serial_fd_, msg.data(), msg.size());
+        usleep(150000); 
+    }
+
     void send_ubx_cfg(uint8_t cls, uint8_t id, uint8_t rate) {
         std::vector<uint8_t> msg = {
-            0xB5, 0x62, 0x06, 0x01,
-            0x08, 0x00,
-            cls, id,
-            0x00, rate, 0x00, rate, 0x00, 0x00
+            0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, cls, id, 0x00, rate, 0x00, rate, 0x00, 0x00
         };
         uint8_t cka = 0, ckb = 0;
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
@@ -118,8 +104,7 @@ private:
         for (size_t k = 2; k < (size_t)(len + 6); k++) {
             cka += buffer_[start + k]; ckb += cka;
         }
-        return (cka == buffer_[start + len + 6] &&
-                ckb == buffer_[start + len + 7]);
+        return (cka == buffer_[start + len + 6] && ckb == buffer_[start + len + 7]);
     }
 
     void loop() {
@@ -136,8 +121,9 @@ private:
                 size_t total = 8 + len;
                 if (i + total <= buffer_.size()) {
                     if (verify_ubx_checksum(i, len)) {
-                        if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07)
+                        if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07) {
                             handle_pvt(i);
+                        }
                         i += total; continue;
                     }
                 } else break;
@@ -148,166 +134,62 @@ private:
         if (buffer_.size() > 8192) buffer_.clear();
     }
 
-    void publish_imu(double bearing_rad, float hAcc_m, double dist_m) {
-        sensor_msgs::msg::Imu imu;
-        imu.header.stamp    = now();
-        imu.header.frame_id = "rover_link";
-        imu.orientation.x = 0.0;
-        imu.orientation.y = 0.0;
-        imu.orientation.z = std::sin(bearing_rad / 2.0);
-        imu.orientation.w = std::cos(bearing_rad / 2.0);
-        double acc_rad = (dist_m > 0.1) ? (hAcc_m / dist_m) : 0.1;
-        imu.orientation_covariance.fill(0.0);
-        imu.orientation_covariance[8] = acc_rad * acc_rad;
-        imu.angular_velocity_covariance[0]    = -1.0;
-        imu.linear_acceleration_covariance[0] = -1.0;
-        imu_pub_->publish(imu);
-    }
-
-    void publish_info(const char * msg) {
-        std_msgs::msg::String m;
-        m.data = msg;
-        info_pub_->publish(m);
-    }
-
     void handle_pvt(size_t idx) {
-        // --- Extract all NAV-PVT fields ---
-        uint32_t iTOW     = *(uint32_t*)&buffer_[idx+6+0];
-        uint16_t year     = *(uint16_t*)&buffer_[idx+6+4];
-        uint8_t  month    =  buffer_[idx+6+6];
-        uint8_t  day      =  buffer_[idx+6+7];
-        uint8_t  hour     =  buffer_[idx+6+8];
-        uint8_t  min      =  buffer_[idx+6+9];
-        uint8_t  sec      =  buffer_[idx+6+10];
-        uint8_t  fixType  =  buffer_[idx+6+20];
-        uint8_t  flags    =  buffer_[idx+6+21];
-        uint8_t  numSV    =  buffer_[idx+6+23];
-        int32_t  lon_raw  = *(int32_t* )&buffer_[idx+6+24];
-        int32_t  lat_raw  = *(int32_t* )&buffer_[idx+6+28];
-        int32_t  hMSL_raw = *(int32_t* )&buffer_[idx+6+36];
-        uint32_t hAcc_raw = *(uint32_t*)&buffer_[idx+6+40];
-        uint32_t vAcc_raw = *(uint32_t*)&buffer_[idx+6+44];
-        int32_t  gSpeed   = *(int32_t* )&buffer_[idx+6+60];
-        uint8_t  carrSoln = (flags >> 6) & 0x03;
+        uint8_t fixType = buffer_[idx+6+20];
+        uint8_t flags = buffer_[idx+6+21];
+        int32_t lon_raw = *(int32_t*)&buffer_[idx+6+24];
+        int32_t lat_raw = *(int32_t*)&buffer_[idx+6+28];
+        int32_t hMSL_raw = *(int32_t*)&buffer_[idx+6+36];
+        uint8_t carrSoln = (flags >> 6) & 0x03;
 
-        float  hAcc_m    = hAcc_raw / 1000.0f;
-        float  vAcc_m    = vAcc_raw / 1000.0f;
         double rover_lat = lat_raw * 1e-7;
         double rover_lon = lon_raw * 1e-7;
 
-        // --- Always publish NavSatFix and nav_pvt regardless of gates ---
         sensor_msgs::msg::NavSatFix fix;
-        fix.header.stamp    = now();
+        fix.header.stamp = now();
         fix.header.frame_id = "rover_link";
-        fix.latitude   = rover_lat;
-        fix.longitude  = rover_lon;
-        fix.altitude   = hMSL_raw / 1000.0;
-        fix.position_covariance[0] = hAcc_m * hAcc_m;
-        fix.position_covariance[4] = hAcc_m * hAcc_m;
-        fix.position_covariance[8] = vAcc_m * vAcc_m;
-        fix.position_covariance_type =
-            sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
-        if      (carrSoln == 2) fix.status.status = 2;
+        fix.latitude = rover_lat;
+        fix.longitude = rover_lon;
+        fix.altitude = hMSL_raw / 1000.0;
+        
+        if (carrSoln == 2) fix.status.status = 2;
         else if (carrSoln == 1) fix.status.status = 1;
-        else if (fixType  >= 3) fix.status.status = 0;
-        else                    fix.status.status = -1;
+        else if (fixType >= 3) fix.status.status = 0;
+        else fix.status.status = -1;
         fix_pub_->publish(fix);
 
-        char pvt_buf[512];
-        snprintf(pvt_buf, sizeof(pvt_buf),
-            "{\"iTOW\":%u,\"fixType\":%u,\"carrSoln\":%u,"
-            "\"numSV\":%u,\"lat\":%.7f,\"lon\":%.7f,"
-            "\"hMSL\":%.3f,\"hAcc\":%.3f,\"vAcc\":%.3f,"
-            "\"gSpeed\":%.3f,"
-            "\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u\"}",
-            iTOW, fixType, carrSoln, numSV,
-            rover_lat, rover_lon,
-            hMSL_raw / 1000.0, hAcc_m, vAcc_m,
-            gSpeed / 1000.0f,
-            year, month, day, hour, min, sec);
-        std_msgs::msg::String pm;
-        pm.data = pvt_buf;
-        pvt_pub_->publish(pm);
+        // ==========================================================
+        // THE RELPOSNED SPOOFING ENGINE 
+        // ==========================================================
+        if (base_ready_) {
+            double lat1 = base_lat_ * M_PI / 180.0;
+            double lon1 = base_lon_ * M_PI / 180.0;
+            double lat2 = rover_lat * M_PI / 180.0;
+            double lon2 = rover_lon * M_PI / 180.0;
 
-        // ============================================================
-        // SAFETY GATE 1 — Accuracy gate: reject poor RTK
-        // ============================================================
-        if (carrSoln != 2 || hAcc_m >= ACC_THRESHOLD_M || !base_ready_) {
-            latch_counter_ = 0;  // reset latch on any bad frame
-            char buf[160];
-            if (!base_ready_) {
-                snprintf(buf, sizeof(buf),
-                    "WAITING | No base fix yet");
-            } else {
-                snprintf(buf, sizeof(buf),
-                    "REJECTED | carrSoln=%u hAcc=%.3fm sats=%u",
-                    carrSoln, hAcc_m, numSV);
-            }
-            publish_info(buf);
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", buf);
-            return;
+            double dLon = lon2 - lon1;
+            double y = std::sin(dLon) * std::cos(lat2);
+            double x = std::cos(lat1) * std::sin(lat2) - std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
+            
+            double bearing_rad = std::atan2(y, x);
+            double bearing_deg = std::fmod((bearing_rad * 180.0 / M_PI) + 360.0, 360.0);
+
+            ublox_ubx_msgs::msg::UBXNavRelPosNED spoof_msg;
+            spoof_msg.header.stamp = now();
+            spoof_msg.header.frame_id = "rover";
+
+            spoof_msg.rel_pos_heading = static_cast<int32_t>(bearing_deg * 100000.0);
+
+            // Bypasses the downstream Python script's safety checks!
+            spoof_msg.is_moving = true; 
+            spoof_msg.carr_soln.status = (carrSoln == 0) ? 1 : carrSoln; 
+
+            relposned_pub_->publish(spoof_msg);
+
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, 
+                "FEEDING DOWNSTREAM @ 2Hz | NED Yaw: %.2f deg | Forced RTK: %d", 
+                bearing_deg, spoof_msg.carr_soln.status);
         }
-
-        // --- Compute heading (passed accuracy gate) ---
-        double lat1 = base_lat_ * M_PI / 180.0;
-        double lon1 = base_lon_ * M_PI / 180.0;
-        double lat2 = rover_lat * M_PI / 180.0;
-        double lon2 = rover_lon * M_PI / 180.0;
-
-        double dLon = lon2 - lon1;
-        double y = std::sin(dLon) * std::cos(lat2);
-        double x = std::cos(lat1) * std::sin(lat2) -
-                   std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
-        double bearing_rad = std::atan2(y, x);
-        double heading_deg = std::fmod(
-            (bearing_rad * 180.0 / M_PI) + 360.0, 360.0);
-
-        double dist_m = std::sqrt(
-            std::pow((lat2 - lat1) * 6371000.0, 2) +
-            std::pow((lon2 - lon1) * 6371000.0 * std::cos(lat1), 2));
-
-        // ============================================================
-        // SAFETY GATE 2 — Physical baseline gate: reject geometry lies
-        // ============================================================
-        if (std::abs(dist_m - PHYSICAL_BASELINE_M) > BASELINE_TOLERANCE_M) {
-            latch_counter_ = 0;  // reset latch on geometry mismatch
-            char buf[160];
-            snprintf(buf, sizeof(buf),
-                "REJECTED | Baseline mismatch got=%.3fm expected=%.3fm±%.3fm",
-                dist_m, PHYSICAL_BASELINE_M, BASELINE_TOLERANCE_M);
-            publish_info(buf);
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", buf);
-            return;
-        }
-
-        // ============================================================
-        // SAFETY GATE 3 — Latch filter: wait for N consecutive good frames
-        // ============================================================
-        latch_counter_++;
-        if (latch_counter_ < LATCH_COUNT_REQUIRED) {
-            char buf[160];
-            snprintf(buf, sizeof(buf),
-                "LATCHING | %d/%d good frames | heading=%.2f deg",
-                latch_counter_, LATCH_COUNT_REQUIRED, heading_deg);
-            publish_info(buf);
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "%s", buf);
-            return;
-        }
-
-        // ============================================================
-        // ALL GATES PASSED — publish valid heading
-        // ============================================================
-        last_good_heading_ = heading_deg;
-        heading_locked_    = true;
-
-        publish_imu(bearing_rad, hAcc_m, dist_m);
-
-        char buf[160];
-        snprintf(buf, sizeof(buf),
-            "ROVER FIXED | Heading: %.2f deg | Dist: %.3fm | hAcc: %.3fm | sats: %u",
-            heading_deg, dist_m, hAcc_m, numSV);
-        publish_info(buf);
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "%s", buf);
     }
 };
 

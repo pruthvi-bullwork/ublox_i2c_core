@@ -7,15 +7,14 @@
   <maintainer email="bullwork@ubuntu.com">bullwork</maintainer>
   <license>Apache-2.0</license>
 
-<buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rtcm_msgs</depend>
-  
-  <test_depend>ament_lint_auto</test_depend>
+  <depend>ublox_ubx_msgs</depend> <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
     
   <exec_depend>ntrip_client_node</exec_depend>
