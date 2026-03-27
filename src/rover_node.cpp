@@ -12,8 +12,6 @@ class RoverNode : public rclcpp::Node {
 public:
     RoverNode() : Node("rover_node") {
         fix_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/rover/fix", 10);
-        
-        // THIS is the topic your Python script is waiting for!
         relposned_pub_ = create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>("/rover/ubx_nav_rel_pos_ned", 10);
 
         base_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -39,7 +37,7 @@ public:
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
-        RCLCPP_INFO(get_logger(), "Rover node ready. Locked at 2Hz. Spoofing RELPOSNED.");
+        RCLCPP_INFO(get_logger(), "Rover node ready. Smart Vector Filtering Enabled.");
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -50,6 +48,11 @@ private:
 
     double base_lat_{0.0}, base_lon_{0.0};
     bool base_ready_{false};
+
+    // --- Smart Filter Variables ---
+    double filtered_y_ = 0.0;
+    double filtered_x_ = 0.0;
+    bool filter_initialized_ = false;
 
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
@@ -74,12 +77,8 @@ private:
 
     void send_ubx_cfg_rate(uint16_t rate_ms) {
         std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00};
-        msg.push_back(rate_ms & 0xFF);
-        msg.push_back((rate_ms >> 8) & 0xFF);
-        msg.push_back(0x01); 
-        msg.push_back(0x00); 
-        msg.push_back(0x01); 
-        msg.push_back(0x00); 
+        msg.push_back(rate_ms & 0xFF); msg.push_back((rate_ms >> 8) & 0xFF);
+        msg.push_back(0x01); msg.push_back(0x00); msg.push_back(0x01); msg.push_back(0x00); 
         uint8_t cka = 0, ckb = 0;
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
         msg.push_back(cka); msg.push_back(ckb);
@@ -88,9 +87,7 @@ private:
     }
 
     void send_ubx_cfg(uint8_t cls, uint8_t id, uint8_t rate) {
-        std::vector<uint8_t> msg = {
-            0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, cls, id, 0x00, rate, 0x00, rate, 0x00, 0x00
-        };
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, cls, id, 0x00, rate, 0x00, rate, 0x00, 0x00};
         uint8_t cka = 0, ckb = 0;
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
         msg.push_back(cka); msg.push_back(ckb);
@@ -101,9 +98,7 @@ private:
     bool verify_ubx_checksum(size_t start, uint16_t len) {
         if (start + 8 + len > buffer_.size()) return false;
         uint8_t cka = 0, ckb = 0;
-        for (size_t k = 2; k < (size_t)(len + 6); k++) {
-            cka += buffer_[start + k]; ckb += cka;
-        }
+        for (size_t k = 2; k < (size_t)(len + 6); k++) { cka += buffer_[start + k]; ckb += cka; }
         return (cka == buffer_[start + len + 6] && ckb == buffer_[start + len + 7]);
     }
 
@@ -121,9 +116,7 @@ private:
                 size_t total = 8 + len;
                 if (i + total <= buffer_.size()) {
                     if (verify_ubx_checksum(i, len)) {
-                        if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07) {
-                            handle_pvt(i);
-                        }
+                        if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07) handle_pvt(i);
                         i += total; continue;
                     }
                 } else break;
@@ -159,7 +152,7 @@ private:
         fix_pub_->publish(fix);
 
         // ==========================================================
-        // THE RELPOSNED SPOOFING ENGINE 
+        // SMART VECTOR SMOOTHING ENGINE (Aussie Hardware Logic)
         // ==========================================================
         if (base_ready_) {
             double lat1 = base_lat_ * M_PI / 180.0;
@@ -168,10 +161,28 @@ private:
             double lon2 = rover_lon * M_PI / 180.0;
 
             double dLon = lon2 - lon1;
-            double y = std::sin(dLon) * std::cos(lat2);
-            double x = std::cos(lat1) * std::sin(lat2) - std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
             
-            double bearing_rad = std::atan2(y, x);
+            // Raw Cartesian Vectors
+            double current_y = std::sin(dLon) * std::cos(lat2);
+            double current_x = std::cos(lat1) * std::sin(lat2) - std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
+            
+            // DYNAMIC TRUST FACTOR (alpha):
+            // If RTK Fixed: 0.8 (Trust it, fast response)
+            // If RTK Float/None: 0.15 (Heavy smoothing, stop the jitter)
+            double alpha = (carrSoln == 2) ? 0.8 : 0.15;
+
+            if (!filter_initialized_) {
+                filtered_y_ = current_y;
+                filtered_x_ = current_x;
+                filter_initialized_ = true;
+            } else {
+                // Apply Exponential Moving Average to Vectors
+                filtered_y_ = (alpha * current_y) + ((1.0 - alpha) * filtered_y_);
+                filtered_x_ = (alpha * current_x) + ((1.0 - alpha) * filtered_x_);
+            }
+
+            // Calculate the smoothed bearing
+            double bearing_rad = std::atan2(filtered_y_, filtered_x_);
             double bearing_deg = std::fmod((bearing_rad * 180.0 / M_PI) + 360.0, 360.0);
 
             ublox_ubx_msgs::msg::UBXNavRelPosNED spoof_msg;
@@ -179,16 +190,14 @@ private:
             spoof_msg.header.frame_id = "rover";
 
             spoof_msg.rel_pos_heading = static_cast<int32_t>(bearing_deg * 100000.0);
-
-            // Bypasses the downstream Python script's safety checks!
             spoof_msg.is_moving = true; 
             spoof_msg.carr_soln.status = (carrSoln == 0) ? 1 : carrSoln; 
 
             relposned_pub_->publish(spoof_msg);
 
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, 
-                "FEEDING DOWNSTREAM @ 2Hz | NED Yaw: %.2f deg | Forced RTK: %d", 
-                bearing_deg, spoof_msg.carr_soln.status);
+                "SMART HEADING | Yaw: %06.2f deg | Alpha: %.2f | RTK: %d", 
+                bearing_deg, alpha, spoof_msg.carr_soln.status);
         }
     }
 };
