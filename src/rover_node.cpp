@@ -30,14 +30,14 @@ public:
             return;
         }
 
-        send_ubx_cfg_rate(500); // Lock to 2Hz
+        send_ubx_cfg_rate(500);         // Lock to 2Hz
         send_ubx_cfg(0x01, 0x07, 0x01); // Enable NAV-PVT
-
+        
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
-        RCLCPP_INFO(get_logger(), "Rover node ready. Smart Vector Filtering Enabled.");
+        RCLCPP_INFO(get_logger(), "Rover node ready. Smart Vector Filtering Active. Spoofing RELPOSNED format.");
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -49,7 +49,6 @@ private:
     double base_lat_{0.0}, base_lon_{0.0};
     bool base_ready_{false};
 
-    // --- Smart Filter Variables ---
     double filtered_y_ = 0.0;
     double filtered_x_ = 0.0;
     bool filter_initialized_ = false;
@@ -152,7 +151,7 @@ private:
         fix_pub_->publish(fix);
 
         // ==========================================================
-        // SMART VECTOR SMOOTHING ENGINE (Aussie Hardware Logic)
+        // SMART VECTOR SMOOTHING & AUSSIE ROBOTS FORMAT SPOOFING
         // ==========================================================
         if (base_ready_) {
             double lat1 = base_lat_ * M_PI / 180.0;
@@ -162,13 +161,10 @@ private:
 
             double dLon = lon2 - lon1;
             
-            // Raw Cartesian Vectors
             double current_y = std::sin(dLon) * std::cos(lat2);
             double current_x = std::cos(lat1) * std::sin(lat2) - std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
             
-            // DYNAMIC TRUST FACTOR (alpha):
-            // If RTK Fixed: 0.8 (Trust it, fast response)
-            // If RTK Float/None: 0.15 (Heavy smoothing, stop the jitter)
+            // Smart Filter: Trust heavily if Fixed, Smooth if Float
             double alpha = (carrSoln == 2) ? 0.8 : 0.15;
 
             if (!filter_initialized_) {
@@ -176,15 +172,14 @@ private:
                 filtered_x_ = current_x;
                 filter_initialized_ = true;
             } else {
-                // Apply Exponential Moving Average to Vectors
                 filtered_y_ = (alpha * current_y) + ((1.0 - alpha) * filtered_y_);
                 filtered_x_ = (alpha * current_x) + ((1.0 - alpha) * filtered_x_);
             }
 
-            // Calculate the smoothed bearing
             double bearing_rad = std::atan2(filtered_y_, filtered_x_);
             double bearing_deg = std::fmod((bearing_rad * 180.0 / M_PI) + 360.0, 360.0);
 
+            // Spoof the Aussie Robots UBXNavRelPosNED format to feed the downstream Python script
             ublox_ubx_msgs::msg::UBXNavRelPosNED spoof_msg;
             spoof_msg.header.stamp = now();
             spoof_msg.header.frame_id = "rover";
