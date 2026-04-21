@@ -1,6 +1,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
+#include "std_msgs/msg/string.hpp" // <-- ADDED FOR JSON
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -13,6 +14,7 @@ public:
     RoverNode() : Node("rover_node") {
         fix_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/rover/fix", 10);
         relposned_pub_ = create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>("/rover/ubx_nav_rel_pos_ned", 10);
+        pvt_pub_ = create_publisher<std_msgs::msg::String>("/rover/nav_pvt", 10); // <-- ADDED JSON PUBLISHER
 
         base_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
             "/gps/fix", 10,
@@ -55,6 +57,7 @@ private:
 
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pvt_pub_; // <-- ADDED JSON PUBLISHER
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr base_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
@@ -127,13 +130,45 @@ private:
     }
 
     void handle_pvt(size_t idx) {
+        // 1. Basic Fix Data
         uint8_t fixType = buffer_[idx+6+20];
         uint8_t flags = buffer_[idx+6+21];
+        uint8_t carrSoln = (flags >> 6) & 0x03;
         int32_t lon_raw = *(int32_t*)&buffer_[idx+6+24];
         int32_t lat_raw = *(int32_t*)&buffer_[idx+6+28];
         int32_t hMSL_raw = *(int32_t*)&buffer_[idx+6+36];
-        uint8_t carrSoln = (flags >> 6) & 0x03;
+        uint32_t hAcc_raw = *(uint32_t*)&buffer_[idx+6+40];
+        uint32_t vAcc_raw = *(uint32_t*)&buffer_[idx+6+44];
+        
+        float hAcc_m = hAcc_raw / 1000.0f;
+        float vAcc_m = vAcc_raw / 1000.0f;
 
+        // 2. Extra Data for JSON Payload
+        uint32_t iTOW = *(uint32_t*)&buffer_[idx + 6 + 0];
+        uint16_t year = *(uint16_t*)&buffer_[idx + 6 + 4];
+        uint8_t month = buffer_[idx + 6 + 6];
+        uint8_t day   = buffer_[idx + 6 + 7];
+        uint8_t hour  = buffer_[idx + 6 + 8];
+        uint8_t min   = buffer_[idx + 6 + 9];
+        uint8_t sec   = buffer_[idx + 6 + 10];
+        uint8_t numSV = buffer_[idx + 6 + 23];
+        int32_t gSpeed_raw = *(int32_t*)&buffer_[idx + 6 + 60];
+
+        // 3. Format and Publish JSON String
+        char pvt_buf[512];
+        snprintf(pvt_buf, sizeof(pvt_buf),
+            "{\"iTOW\":%u,\"fixType\":%u,\"carrSoln\":%u,\"numSV\":%u,"
+            "\"lat\":%.7f,\"lon\":%.7f,\"hMSL\":%.3f,\"hAcc\":%.3f,\"vAcc\":%.3f,"
+            "\"gSpeed\":%.3f,\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u\"}",
+            iTOW, fixType, carrSoln, numSV, lat_raw * 1e-7, lon_raw * 1e-7,
+            hMSL_raw / 1000.0, hAcc_m, vAcc_m, gSpeed_raw / 1000.0f,
+            year, month, day, hour, min, sec);
+        
+        auto pvt_msg = std_msgs::msg::String();
+        pvt_msg.data = pvt_buf;
+        pvt_pub_->publish(pvt_msg);
+
+        // 4. Publish Standard NavSatFix Message
         double rover_lat = lat_raw * 1e-7;
         double rover_lon = lon_raw * 1e-7;
 
@@ -143,6 +178,11 @@ private:
         fix.latitude = rover_lat;
         fix.longitude = rover_lon;
         fix.altitude = hMSL_raw / 1000.0;
+
+        fix.position_covariance[0] = hAcc_m * hAcc_m;
+        fix.position_covariance[4] = hAcc_m * hAcc_m;
+        fix.position_covariance[8] = vAcc_m * vAcc_m; 
+        fix.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
         
         if (carrSoln == 2) fix.status.status = 2;
         else if (carrSoln == 1) fix.status.status = 1;
