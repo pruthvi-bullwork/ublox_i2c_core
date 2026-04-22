@@ -1,11 +1,10 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
-#include "std_msgs/msg/string.hpp" // <-- ADDED FOR JSON
+#include "std_msgs/msg/string.hpp" 
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
-#include <cmath>
 #include <vector>
 #include <string>
 
@@ -14,15 +13,7 @@ public:
     RoverNode() : Node("rover_node") {
         fix_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/rover/fix", 10);
         relposned_pub_ = create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>("/rover/ubx_nav_rel_pos_ned", 10);
-        pvt_pub_ = create_publisher<std_msgs::msg::String>("/rover/nav_pvt", 10); // <-- ADDED JSON PUBLISHER
-
-        base_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-            "/gps/fix", 10,
-            [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-                base_lat_ = msg->latitude;
-                base_lon_ = msg->longitude;
-                base_ready_ = true;
-            });
+        pvt_pub_ = create_publisher<std_msgs::msg::String>("/rover/nav_pvt", 10); 
 
         declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
         std::string port = get_parameter("serial_port").as_string();
@@ -34,12 +25,13 @@ public:
 
         send_ubx_cfg_rate(500);         // Lock to 2Hz
         send_ubx_cfg(0x01, 0x07, 0x01); // Enable NAV-PVT
+        send_ubx_cfg(0x01, 0x3C, 0x01); // Enable Hardware NAV-RELPOSNED
         
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
-        RCLCPP_INFO(get_logger(), "Rover node ready. Smart Vector Filtering Active. Spoofing RELPOSNED format.");
+        RCLCPP_INFO(get_logger(), "Rover node ready. Hardware RELPOSNED Active. Dropping invalid headings.");
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -48,17 +40,9 @@ private:
     int serial_fd_ = -1;
     std::vector<uint8_t> buffer_;
 
-    double base_lat_{0.0}, base_lon_{0.0};
-    bool base_ready_{false};
-
-    double filtered_y_ = 0.0;
-    double filtered_x_ = 0.0;
-    bool filter_initialized_ = false;
-
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pvt_pub_; // <-- ADDED JSON PUBLISHER
-    rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr base_sub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pvt_pub_; 
     rclcpp::TimerBase::SharedPtr timer_;
 
     bool init_serial(const std::string& port, int baud) {
@@ -119,6 +103,7 @@ private:
                 if (i + total <= buffer_.size()) {
                     if (verify_ubx_checksum(i, len)) {
                         if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07) handle_pvt(i);
+                        else if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x3C) handle_relposned(i);
                         i += total; continue;
                     }
                 } else break;
@@ -129,8 +114,40 @@ private:
         if (buffer_.size() > 8192) buffer_.clear();
     }
 
+    // Parses the true Hardware Vector payload
+    void handle_relposned(size_t idx) {
+        int32_t heading_raw = *(int32_t*)&buffer_[idx+6+24];
+        uint32_t flags = *(uint32_t*)&buffer_[idx+6+60];
+
+        ublox_ubx_msgs::msg::UBXNavRelPosNED msg;
+        msg.header.stamp = now();
+        msg.header.frame_id = "rover";
+        
+        msg.rel_pos_heading = heading_raw;
+        
+        // Extract boolean flags straight from the u-blox chip's bitmask
+        msg.gnss_fix_ok = (flags & 0x01) != 0;
+        msg.diff_soln = (flags & 0x02) != 0;
+        msg.rel_pos_valid = (flags & 0x04) != 0;
+        msg.carr_soln.status = (flags >> 3) & 0x03;
+        msg.is_moving = (flags & 0x20) != 0;
+        msg.rel_pos_heading_valid = (flags & 0x100) != 0; 
+
+        double heading_deg = heading_raw * 1e-5;
+
+        // ONLY publish to the EKF if the hardware confirms the heading is actually valid!
+        if (msg.rel_pos_heading_valid) {
+            relposned_pub_->publish(msg);
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, 
+                "HARDWARE HEADING | Yaw: %06.2f deg | Valid: %d | RTK: %d", 
+                heading_deg, msg.rel_pos_heading_valid, msg.carr_soln.status);
+        } else {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, 
+                "HARDWARE HEADING | DROPPED (Waiting for Base RTCM on UART2)");
+        }
+    }
+
     void handle_pvt(size_t idx) {
-        // 1. Basic Fix Data
         uint8_t fixType = buffer_[idx+6+20];
         uint8_t flags = buffer_[idx+6+21];
         uint8_t carrSoln = (flags >> 6) & 0x03;
@@ -143,7 +160,6 @@ private:
         float hAcc_m = hAcc_raw / 1000.0f;
         float vAcc_m = vAcc_raw / 1000.0f;
 
-        // 2. Extra Data for JSON Payload
         uint32_t iTOW = *(uint32_t*)&buffer_[idx + 6 + 0];
         uint16_t year = *(uint16_t*)&buffer_[idx + 6 + 4];
         uint8_t month = buffer_[idx + 6 + 6];
@@ -154,7 +170,6 @@ private:
         uint8_t numSV = buffer_[idx + 6 + 23];
         int32_t gSpeed_raw = *(int32_t*)&buffer_[idx + 6 + 60];
 
-        // 3. Format and Publish JSON String
         char pvt_buf[512];
         snprintf(pvt_buf, sizeof(pvt_buf),
             "{\"iTOW\":%u,\"fixType\":%u,\"carrSoln\":%u,\"numSV\":%u,"
@@ -168,7 +183,6 @@ private:
         pvt_msg.data = pvt_buf;
         pvt_pub_->publish(pvt_msg);
 
-        // 4. Publish Standard NavSatFix Message
         double rover_lat = lat_raw * 1e-7;
         double rover_lon = lon_raw * 1e-7;
 
@@ -189,51 +203,6 @@ private:
         else if (fixType >= 3) fix.status.status = 0;
         else fix.status.status = -1;
         fix_pub_->publish(fix);
-
-        // ==========================================================
-        // SMART VECTOR SMOOTHING & AUSSIE ROBOTS FORMAT SPOOFING
-        // ==========================================================
-        if (base_ready_) {
-            double lat1 = base_lat_ * M_PI / 180.0;
-            double lon1 = base_lon_ * M_PI / 180.0;
-            double lat2 = rover_lat * M_PI / 180.0;
-            double lon2 = rover_lon * M_PI / 180.0;
-
-            double dLon = lon2 - lon1;
-            
-            double current_y = std::sin(dLon) * std::cos(lat2);
-            double current_x = std::cos(lat1) * std::sin(lat2) - std::sin(lat1) * std::cos(lat2) * std::cos(dLon);
-            
-            // Smart Filter: Trust heavily if Fixed, Smooth if Float
-            double alpha = (carrSoln == 2) ? 0.8 : 0.15;
-
-            if (!filter_initialized_) {
-                filtered_y_ = current_y;
-                filtered_x_ = current_x;
-                filter_initialized_ = true;
-            } else {
-                filtered_y_ = (alpha * current_y) + ((1.0 - alpha) * filtered_y_);
-                filtered_x_ = (alpha * current_x) + ((1.0 - alpha) * filtered_x_);
-            }
-
-            double bearing_rad = std::atan2(filtered_y_, filtered_x_);
-            double bearing_deg = std::fmod((bearing_rad * 180.0 / M_PI) + 360.0, 360.0);
-
-            // Spoof the Aussie Robots UBXNavRelPosNED format to feed the downstream Python script
-            ublox_ubx_msgs::msg::UBXNavRelPosNED spoof_msg;
-            spoof_msg.header.stamp = now();
-            spoof_msg.header.frame_id = "rover";
-
-            spoof_msg.rel_pos_heading = static_cast<int32_t>(bearing_deg * 100000.0);
-            spoof_msg.is_moving = true; 
-            spoof_msg.carr_soln.status = (carrSoln == 0) ? 1 : carrSoln; 
-
-            relposned_pub_->publish(spoof_msg);
-
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, 
-                "SMART HEADING | Yaw: %06.2f deg | Alpha: %.2f | RTK: %d", 
-                bearing_deg, alpha, spoof_msg.carr_soln.status);
-        }
     }
 };
 
