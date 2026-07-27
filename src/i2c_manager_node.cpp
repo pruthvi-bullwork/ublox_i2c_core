@@ -17,14 +17,21 @@ public:
 
 private:
     void rtcm_callback(const rtcm_msgs::msg::Message::SharedPtr msg) {
-        // 1. Physically write the data to the I2C bus
-        i2c_->write_rtcm(msg->message);
-        
-        // 2. Throttle the print statement to only output once every 10,000 ms (10 seconds)
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, 
-            "📡 NTRIP -> I2C: Actively injecting RTCM data (Last packet: %zu bytes)", msg->message.size());
-    }
+        // NTRIP injection temporarily disabled — uncomment write_rtcm to re-enable
+        // i2c_->write_rtcm(msg->message);
 
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+            "📡 NTRIP -> I2C: INJECTION DISABLED (received %zu bytes, not forwarded)", msg->message.size());
+    
+       
+    // // 1. Physically write the data to the I2C bus
+        // i2c_->write_rtcm(msg->message);
+        
+        // // 2. Throttle the print statement to only output once every 10,000 ms (10 seconds)
+        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, 
+        //     "📡 NTRIP -> I2C: Actively injecting RTCM data (Last packet: %zu bytes)", msg->message.size());
+    }
+    
     std::unique_ptr<UbloxI2C> i2c_;
     rclcpp::Subscription<rtcm_msgs::msg::Message>::SharedPtr sub_;
 };

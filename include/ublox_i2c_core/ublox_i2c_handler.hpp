@@ -35,8 +35,11 @@ public:
     UbloxI2C(int bus, int addr);
     std::vector<uint8_t> read_bus();
     void write_rtcm(const std::vector<uint8_t>& data);
+    void write_ubx(const std::vector<uint8_t>& data);
 private:
+    uint16_t bytes_available();
     int fd_;
+    uint8_t addr_;
 };
 
 #endif

@@ -16,7 +16,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         # NTRIP Client (Fetches from Internet)
-        ntrip_launch,
+        # ntrip_launch,
 
         # I2C Manager (Bridges NTRIP topic -> I2C Hardware)
         Node(package='ublox_i2c_core', executable='i2c_manager_node', name='i2c_bridge'),
