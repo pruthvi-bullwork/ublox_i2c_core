@@ -3,6 +3,9 @@
 #include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_pvt.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "rtcm_msgs/msg/message.hpp"
+#include "ublox_i2c_core/ublox_i2c_handler.hpp"
+#include <cerrno>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -23,23 +26,41 @@ public:
         relposned_pub_ = create_publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>("/rover/ubx_nav_rel_pos_ned", 10);
         pvt_pub_       = create_publisher<ublox_ubx_msgs::msg::UBXNavPVT>("/rover/ubx_nav_pvt", 10);
 
-        declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
-        std::string port = get_parameter("serial_port").as_string();
+        // Base and rover are physically identical X20P modules with no factory
+        // USB serial string; each was programmed with a distinct one
+        // (rover="tseT") to tell them apart on the USB bus -- see
+        // supervisor/tools/program_ublox_serial.py. Previously this node read
+        // over /dev/ttyTHS1, a Jetson hardware UART wired directly to the
+        // rover's UART1 -- now it talks to the module's own USB CDC-ACM port.
+        std::string usb_serial = declare_parameter<std::string>("device_serial_string", "tseT");
+        declare_parameter<std::string>("serial_port", "");  // optional explicit override / fallback
+        std::string fallback_port = get_parameter("serial_port").as_string();
 
-        if (!init_serial(port, 115200)) {
-            RCLCPP_ERROR(get_logger(), "Failed to open %s", port.c_str());
+        std::string port = find_tty_by_usb_serial(usb_serial);
+        if (port.empty()) port = fallback_port;
+
+        if (port.empty() || !init_serial(port, 115200)) {
+            RCLCPP_ERROR(get_logger(), "Could not find/open a USB serial device with iSerial='%s'. Is the rover module plugged in and programmed?", usb_serial.c_str());
             return;
         }
+        RCLCPP_INFO(get_logger(), "Rover module found at %s (iSerial='%s').", port.c_str(), usb_serial.c_str());
 
         send_ubx_set_uart2_baud(460800);
-        send_ubx_cfg_rate(40, 5);
-        send_ubx_enable_uart1_messages();
+        send_ubx_cfg_rate(100, 5);
+        send_ubx_enable_usb_messages();
+        send_ubx_enable_usb_rtcm_in();
+
+        // Moving-base corrections arrive from base_node (read off the base's USB port)
+        // and are written straight to this module's USB port.
+        rtcm_sub_ = create_subscription<rtcm_msgs::msg::Message>(
+            "/base/rtcm", 50,
+            [this](const rtcm_msgs::msg::Message::SharedPtr m) { write_rtcm_to_rover(m->message); });
 
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
-        RCLCPP_INFO(get_logger(), "Rover node ready. CFG-RATE meas=40ms nav=5.");
+        RCLCPP_INFO(get_logger(), "Rover node ready. CFG-RATE meas=100ms (10 Hz) nav=5.");
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -51,7 +72,41 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr          fix_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavPVT>::SharedPtr       pvt_pub_;
+    rclcpp::Subscription<rtcm_msgs::msg::Message>::SharedPtr           rtcm_sub_;
+    unsigned long rtcm_written_ = 0;
     rclcpp::TimerBase::SharedPtr timer_;
+
+    void write_rtcm_to_rover(const std::vector<uint8_t>& data) {
+        if (serial_fd_ < 0 || data.empty()) return;
+        size_t off = 0;
+        int retries = 0;
+        while (off < data.size()) {
+            ssize_t w = write(serial_fd_, data.data() + off, data.size() - off);
+            if (w > 0) { off += (size_t)w; continue; }
+            if (errno == EAGAIN && retries++ < 5) { usleep(1000); continue; }
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "RTCM write to rover failed (errno %d)", errno);
+            return;
+        }
+        rtcm_written_++;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+            "RTCM relay: %lu frames written to rover USB so far", rtcm_written_);
+    }
+
+    // UBX-CFG-VALSET (0x06 0x8A): make sure RTCM3X is accepted as a USB input protocol.
+    // key 0x10770004 = CFG-USBINPROT-RTCM3X (verified against pyubx2's database).
+    void send_ubx_enable_usb_rtcm_in() {
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00};
+        msg.push_back(0x00);        // version
+        msg.push_back(0x01);        // layer: RAM-only
+        msg.push_back(0x00); msg.push_back(0x00);  // reserved
+        msg.push_back(0x04); msg.push_back(0x00); msg.push_back(0x77); msg.push_back(0x10);
+        msg.push_back(0x01);        // value (L) = 1
+        uint8_t cka = 0, ckb = 0;
+        for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
+        msg.push_back(cka); msg.push_back(ckb);
+        write(serial_fd_, msg.data(), msg.size());
+        usleep(150000);
+    }
 
     bool init_serial(const std::string& port, int baud) {
         (void)baud;
@@ -115,13 +170,19 @@ private:
         usleep(150000);
     }
 
-    // UBX-CFG-VALSET (0x06 0x8A): enable NAV-PVT and NAV-RELPOSNED output on UART1 (the
-    // port this node reads). Legacy UBX-CFG-MSG (0x06 0x01) is confirmed UBX-ACK-NAK'd on
-    // this receiver, same platform limitation as CFG-RATE above.
-    void send_ubx_enable_uart1_messages() {
+    // UBX-CFG-VALSET (0x06 0x8A): enable UBX as a USB output protocol, plus
+    // NAV-PVT and NAV-RELPOSNED output on USB (the port this node now reads --
+    // previously UART1, wired to the Jetson's hardware serial pins). Legacy
+    // UBX-CFG-MSG (0x06 0x01) is confirmed UBX-ACK-NAK'd on this receiver,
+    // same platform limitation as CFG-RATE above. Keys verified against
+    // pyubx2's UBX_CONFIG_DATABASE. The X20P has UBX protocols enabled by
+    // default but NO output messages enabled by default, so both the
+    // protocol-level and per-message enables are required.
+    void send_ubx_enable_usb_messages() {
         static const std::pair<uint32_t, uint8_t> kItems[] = {
-            {0x20910007, 1},  // CFG-MSGOUT-UBX_NAV_PVT_UART1
-            {0x2091008e, 1},  // CFG-MSGOUT-UBX_NAV_RELPOSNED_UART1
+            {0x10780001, 1},  // CFG-USBOUTPROT-UBX
+            {0x20910009, 1},  // CFG-MSGOUT-UBX_NAV_PVT_USB
+            {0x20910090, 1},  // CFG-MSGOUT-UBX_NAV_RELPOSNED_USB
         };
         uint16_t payload_len = 4 + sizeof(kItems) / sizeof(kItems[0]) * 5;
         std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A,
@@ -252,7 +313,8 @@ private:
                 heading_deg, acc_hdg_deg, length_m, acc_len_m, carrSolnRaw);
         } else {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                "HARDWARE HEADING | DROPPED (Waiting for Base RTCM on UART2)");
+                "HARDWARE HEADING | DROPPED (heading not valid -- waiting for base RTCM; %lu frames relayed to rover so far)",
+                rtcm_written_);
         }
     }
 

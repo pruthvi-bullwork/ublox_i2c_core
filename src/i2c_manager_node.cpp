@@ -5,9 +5,12 @@
 class I2CManagerNode : public rclcpp::Node {
 public:
     I2CManagerNode() : Node("i2c_bridge") {
-        i2c_ = std::make_unique<UbloxI2C>(7, 0x42); 
-        
-        RCLCPP_INFO(this->get_logger(), "I2C Manager: Using Extreme Chunking for 100kHz Bus.");
+        // Targets the base module's USB port (see ublox_i2c_handler.hpp) -- RTCM
+        // injection over this path is currently disabled below regardless.
+        std::string usb_serial = this->declare_parameter<std::string>("device_serial_string", "Tset");
+        i2c_ = std::make_unique<UbloxI2C>(usb_serial);
+
+        RCLCPP_INFO(this->get_logger(), "I2C Manager: targeting base module (iSerial='%s').", usb_serial.c_str());
         
         // Subscribe to the NTRIP client's RTCM topic
         sub_ = this->create_subscription<rtcm_msgs::msg::Message>(

@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <string>
 
 struct NavHpPosLlh {
     uint8_t version; uint8_t reserved1; uint16_t reserved2;
@@ -30,16 +31,33 @@ struct NavRelPosNed {
     uint32_t flags;
 };
 
+// Finds the /dev/ttyACM* node whose USB iSerialNumber matches usb_serial_string
+// (e.g. "Tset" or "tseT"). Returns "" if no match is found. Shared by both
+// UbloxI2C (below) and rover_node.cpp, which manages its own serial fd.
+std::string find_tty_by_usb_serial(const std::string& usb_serial_string);
+
+// NB: class name kept as UbloxI2C for compatibility with existing callers
+// (base_node.cpp, i2c_manager_node.cpp) even though the transport is now the
+// X20P's own USB CDC-ACM interface, not the I2C/DDC bus. The base and rover
+// modules are physically identical and ship with no USB serial string, so
+// they were each programmed with a distinct one (base="Tset", rover="tseT" --
+// see supervisor/tools/program_ublox_serial.py); this class finds the
+// /dev/ttyACM* node whose USB iSerialNumber matches the one requested.
 class UbloxI2C {
 public:
-    UbloxI2C(int bus, int addr);
+    // usb_serial_string: the programmed iSerialNumber to search for (e.g. "Tset").
+    // fallback_device: used only if no USB device with that serial is found
+    // (e.g. during bring-up before a module has been serial-programmed).
+    explicit UbloxI2C(const std::string& usb_serial_string, const std::string& fallback_device = "");
+    ~UbloxI2C();
+    bool is_open() const { return fd_ >= 0; }
+    std::string device_path() const { return device_path_; }
     std::vector<uint8_t> read_bus();
     void write_rtcm(const std::vector<uint8_t>& data);
     void write_ubx(const std::vector<uint8_t>& data);
 private:
-    uint16_t bytes_available();
-    int fd_;
-    uint8_t addr_;
+    int fd_ = -1;
+    std::string device_path_;
 };
 
 #endif

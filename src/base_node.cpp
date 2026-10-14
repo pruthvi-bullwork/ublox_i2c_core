@@ -2,6 +2,7 @@
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_pvt.hpp"
+#include "rtcm_msgs/msg/message.hpp"
 #include "ublox_i2c_core/ublox_i2c_handler.hpp"
 #include <unistd.h>
 #include <vector>
@@ -12,14 +13,38 @@ static T buf_read(const std::vector<uint8_t>& buf, size_t offset) {
     T val; std::memcpy(&val, &buf[offset], sizeof(T)); return val;
 }
 
+// CRC-24Q (RTCM 3 framing): poly 0x1864CFB, init 0, over header + payload.
+static uint32_t crc24q(const uint8_t* p, size_t n) {
+    uint32_t crc = 0;
+    for (size_t k = 0; k < n; k++) {
+        crc ^= (uint32_t)p[k] << 16;
+        for (int b = 0; b < 8; b++) {
+            crc <<= 1;
+            if (crc & 0x1000000) crc ^= 0x1864CFB;
+        }
+    }
+    return crc & 0xFFFFFF;
+}
+
 class BaseNode : public rclcpp::Node {
 public:
     BaseNode() : Node("base_node") {
         fix_pub_  = this->create_publisher<sensor_msgs::msg::NavSatFix>("/gps/fix", 10);
         info_pub_ = this->create_publisher<std_msgs::msg::String>("/gps/info", 10);
         pvt_pub_  = this->create_publisher<ublox_ubx_msgs::msg::UBXNavPVT>("/gps/ubx_nav_pvt", 10);
+        rtcm_pub_ = this->create_publisher<rtcm_msgs::msg::Message>("/base/rtcm", 50);
 
-        i2c_ = std::make_unique<UbloxI2C>(7, 0x42);
+        // Base and rover are physically identical X20P modules with no factory
+        // USB serial string; each was programmed with a distinct one (base="Tset")
+        // to tell them apart on the USB bus -- see
+        // supervisor/tools/program_ublox_serial.py.
+        std::string usb_serial = this->declare_parameter<std::string>("device_serial_string", "Tset");
+        i2c_ = std::make_unique<UbloxI2C>(usb_serial);
+        if (!i2c_->is_open()) {
+            RCLCPP_ERROR(get_logger(), "Could not find/open a USB serial device with iSerial='%s'. Is the base module plugged in and programmed?", usb_serial.c_str());
+        } else {
+            RCLCPP_INFO(get_logger(), "Base module found at %s (iSerial='%s').", i2c_->device_path().c_str(), usb_serial.c_str());
+        }
 
         // When false (default), behave exactly like the original: isotropic hAcc/vAcc
         // covariance, every PVT published, no NAV-COV. Set true to enable the receiver's
@@ -27,18 +52,26 @@ public:
         use_nav_cov_ = this->declare_parameter<bool>("use_nav_cov", false);
 
         send_ubx_set_uart2_baud(460800);
-        send_ubx_cfg_rate(40, 5);
+        send_ubx_cfg_rate(100, 5);
         send_ubx_enable_uart2_ubx_out();
         send_ubx_enable_uart2_rtcm3_out();
         send_ubx_try_enable_4072_0_uart2();
         send_ubx_disable_rtcm3_input();
+        // Unlike the I2C/DDC interface (which had NAV-PVT output enabled from
+        // prior provisioning), the X20P ships with USB protocols enabled but
+        // NO output messages enabled by default -- these two are required or
+        // nothing will ever be read back over USB.
+        send_ubx_enable_usb_ubx_out();
+        send_ubx_enable_usb_nav_pvt();
+        send_ubx_enable_usb_rtcm3_out();
         if (use_nav_cov_) send_ubx_enable_nav_cov();
 
+        // 50 ms (was 200) so relayed RTCM corrections reach the rover with little added latency.
         timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(200),
+            std::chrono::milliseconds(50),
             std::bind(&BaseNode::loop, this));
 
-        RCLCPP_INFO(get_logger(), "Base node ready. CFG-RATE meas=40ms nav=5. UART2 UBX+RTCM3 out enabled, RTCM3 input disabled. NAV-COV %s. Publishing /gps/fix + /gps/ubx_nav_pvt.",
+        RCLCPP_INFO(get_logger(), "Base node ready. CFG-RATE meas=100ms (10 Hz) nav=5. UART2 UBX+RTCM3 out enabled, RTCM3 input disabled. NAV-COV %s. Publishing /gps/fix + /gps/ubx_nav_pvt.",
             use_nav_cov_ ? "enabled" : "disabled");
     }
 
@@ -202,16 +235,91 @@ private:
         usleep(150000);
     }
 
-    // UBX-CFG-VALSET (0x06 0x8A): enable UBX-NAV-COV output on I2C every nav epoch.
-    // key 0x20910087 = CFG-MSGOUT-UBX_NAV_COV_I2C, value 1.
-    // NOTE: verify this key ID against UBX-MON-VER protocol version before trusting.
+    // UBX-CFG-VALSET (0x06 0x8A): enable UBX protocol as a USB output protocol
+    // (port outProtoMask). key 0x10780001 = CFG-USBOUTPROT-UBX, value 1.
+    // Verified against pyubx2's UBX_CONFIG_DATABASE. Required because the X20P
+    // has UBX protocols enabled by default but NO output messages enabled by
+    // default over USB (unlike the I2C/DDC bus this node was originally reading).
+    void send_ubx_enable_usb_ubx_out() {
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00};
+        msg.push_back(0x00);        // version
+        msg.push_back(0x01);        // layer: RAM-only
+        msg.push_back(0x00); msg.push_back(0x00);  // reserved
+        // key 0x10780001, little-endian
+        msg.push_back(0x01); msg.push_back(0x00); msg.push_back(0x78); msg.push_back(0x10);
+        msg.push_back(0x01);        // value (L) = 1
+        uint8_t cka = 0, ckb = 0;
+        for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
+        msg.push_back(cka); msg.push_back(ckb);
+        i2c_->write_ubx(msg);
+        usleep(150000);
+    }
+
+    // UBX-CFG-VALSET (0x06 0x8A): enable UBX-NAV-PVT output on USB every nav epoch.
+    // key 0x20910009 = CFG-MSGOUT-UBX_NAV_PVT_USB, value 1.
+    // Verified against pyubx2's UBX_CONFIG_DATABASE.
+    void send_ubx_enable_usb_nav_pvt() {
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00};
+        msg.push_back(0x00);        // version
+        msg.push_back(0x01);        // layer: RAM-only
+        msg.push_back(0x00); msg.push_back(0x00);  // reserved
+        // key 0x20910009, little-endian
+        msg.push_back(0x09); msg.push_back(0x00); msg.push_back(0x91); msg.push_back(0x20);
+        msg.push_back(0x01);        // value (U1) = 1
+        uint8_t cka = 0, ckb = 0;
+        for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
+        msg.push_back(cka); msg.push_back(ckb);
+        i2c_->write_ubx(msg);
+        usleep(150000);
+    }
+
+    // UBX-CFG-VALSET (0x06 0x8A): enable RTCM3X output on USB with the moving-base message
+    // set (4072.0, MSM7 for GPS/GLO/GAL/BDS, 1230) at every nav epoch, so it can be read here
+    // and relayed to the rover over /base/rtcm. No 1005 -- that is a fixed-base message. All
+    // keys verified against pyubx2's UBX_CONFIG_DATABASE.
+    void send_ubx_enable_usb_rtcm3_out() {
+        static const std::pair<uint32_t, uint8_t> kItems[] = {
+            {0x10780004, 1},  // CFG-USBOUTPROT-RTCM3X
+            {0x20910301, 1},  // CFG-MSGOUT-RTCM_3X_TYPE4072_0_USB
+            {0x209102cf, 1},  // CFG-MSGOUT-RTCM_3X_TYPE1077_USB
+            {0x209102d4, 1},  // CFG-MSGOUT-RTCM_3X_TYPE1087_USB
+            {0x2091031b, 1},  // CFG-MSGOUT-RTCM_3X_TYPE1097_USB
+            {0x209102d9, 1},  // CFG-MSGOUT-RTCM_3X_TYPE1127_USB
+            {0x20910306, 1},  // CFG-MSGOUT-RTCM_3X_TYPE1230_USB
+        };
+        uint16_t payload_len = 4 + sizeof(kItems) / sizeof(kItems[0]) * 5;
+        std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A,
+            (uint8_t)(payload_len & 0xFF), (uint8_t)((payload_len >> 8) & 0xFF)};
+        msg.push_back(0x00);        // version
+        msg.push_back(0x01);        // layer: RAM-only
+        msg.push_back(0x00); msg.push_back(0x00);  // reserved
+        for (const auto& item : kItems) {
+            uint32_t key = item.first;
+            msg.push_back(key & 0xFF); msg.push_back((key >> 8) & 0xFF);
+            msg.push_back((key >> 16) & 0xFF); msg.push_back((key >> 24) & 0xFF);
+            msg.push_back(item.second);
+        }
+        uint8_t cka = 0, ckb = 0;
+        for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
+        msg.push_back(cka); msg.push_back(ckb);
+        i2c_->write_ubx(msg);
+        usleep(150000);
+    }
+
+    // UBX-CFG-VALSET (0x06 0x8A): enable UBX-NAV-COV output on USB every nav epoch.
+    // key 0x20910086 = CFG-MSGOUT-UBX_NAV_COV_USB, value 1. The previous I2C
+    // version of this function used key 0x20910087, which its own comment
+    // flagged as unverified -- it was in fact wrong (0x20910083 is the real
+    // CFG-MSGOUT-UBX_NAV_COV_I2C key; 0x87 doesn't correspond to a real NAV-COV
+    // output key at all). This USB key is verified against pyubx2's
+    // UBX_CONFIG_DATABASE.
     void send_ubx_enable_nav_cov() {
         std::vector<uint8_t> msg = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00};
         msg.push_back(0x00);        // version
         msg.push_back(0x01);        // layer: 0x01 = RAM-only (testing); 0x07 = RAM+BBR+Flash (persist)
         msg.push_back(0x00); msg.push_back(0x00);  // reserved
-        // key 0x20910087, little-endian
-        msg.push_back(0x87); msg.push_back(0x00); msg.push_back(0x91); msg.push_back(0x20);
+        // key 0x20910086, little-endian
+        msg.push_back(0x86); msg.push_back(0x00); msg.push_back(0x91); msg.push_back(0x20);
         msg.push_back(0x01);        // value (U1) = 1
         uint8_t cka = 0, ckb = 0;
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
@@ -254,8 +362,22 @@ private:
                 uint16_t rtcm_len = ((buffer_[i+1] & 0x03) << 8) | buffer_[i+2];
                 if (rtcm_len > 1024) { i++; continue; }
                 size_t total_rtcm = rtcm_len + 6;
-                if (i + total_rtcm <= buffer_.size()) { i += total_rtcm; continue; }
-                else break;
+                if (i + total_rtcm <= buffer_.size()) {
+                    uint32_t want = (buffer_[i + rtcm_len + 3] << 16) | (buffer_[i + rtcm_len + 4] << 8) | buffer_[i + rtcm_len + 5];
+                    if (crc24q(&buffer_[i], rtcm_len + 3) == want) {
+                        rtcm_msgs::msg::Message rtcm;
+                        rtcm.header.stamp = this->now();
+                        rtcm.message.assign(buffer_.begin() + i, buffer_.begin() + i + total_rtcm);
+                        rtcm_pub_->publish(rtcm);
+                        rtcm_frames_++;
+                        rtcm_last_type_ = (buffer_[i+3] << 4) | (buffer_[i+4] >> 4);
+                        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "RTCM relay: %lu frames read from base USB so far (last type %u, %zu bytes)",
+                            rtcm_frames_, rtcm_last_type_, total_rtcm);
+                        i += total_rtcm; continue;
+                    }
+                    rtcm_crc_fail_++;
+                } else break;
             }
             i++;
         }
@@ -462,6 +584,10 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr     fix_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr           info_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavPVT>::SharedPtr pvt_pub_;
+    rclcpp::Publisher<rtcm_msgs::msg::Message>::SharedPtr        rtcm_pub_;
+    unsigned long rtcm_frames_    = 0;
+    unsigned long rtcm_crc_fail_  = 0;
+    unsigned      rtcm_last_type_ = 0;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 
