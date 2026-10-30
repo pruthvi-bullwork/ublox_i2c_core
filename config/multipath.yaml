@@ -1,0 +1,178 @@
+# Multipath mitigation tuning for both u-blox receivers.
+#
+# Two layers:
+#   nav_filter.*  -> UBX-CFG-NAVSPG masks applied to the receiver at startup.
+#                    These keep reflected signals out of the navigation
+#                    solution. Sent one key per CFG-VALSET; check the node log
+#                    for UBX-ACK-ACK / UBX-ACK-NAK to confirm each was taken.
+#   gate.*        -> output-side filter in the node. Drops fixes the receiver
+#                    flagged as poor, and fixes implying impossible motion.
+#
+# Tuning order under canopy: start here, then raise min_cno_dbhz in steps of 3
+# while watching numSV in the node log. If sat count collapses, you have gone
+# too far and are now starving the solution rather than cleaning it.
+
+/**:
+  ros__parameters:
+    nav_filter:
+      enable: true
+      # 3 = pedestrian, the model u-blox recommends for robotic-lawn-mower class
+      # vehicles, which is what this slow skid-steer UGV is. It assumes low
+      # speed and low acceleration with near-constant altitude — and that
+      # altitude constraint is the point. The default (0, portable) allows ~4 g
+      # and free vertical motion, which is exactly the freedom a multipath
+      # excursion exploits to move the fix a long way.
+      #
+      # Do NOT set 11 (mower) or 12 (e-scooter) on this receiver. Those are
+      # sensor-fusion platform models from the ADR/UDR product line (F9R/F9K
+      # class); a ZED-X20P is not a fusion product and UBX-ACK-NAKs them, which
+      # silently leaves the model at 0/portable — the worst case for multipath.
+      # 11 was also a poor fit on its own terms: its ~3 m/s horizontal limit sat
+      # right at this vehicle's top speed. Pedestrian's limit is far above 3 m/s,
+      # so it cannot start clearing gnssFixOk at full throttle.
+      #
+      # 4 (automotive) is the fallback if pedestrian ever proves too tight under
+      # hard skid-steer yaw. Confirm any change via the "CFG readback |
+      # CFG-NAVSPG-DYNMODEL" line at startup, not the ACK — an ACK only means
+      # the frame was accepted, not that the value took.
+      dyn_model: 3
+      # Satellites below this elevation are the ones most often seen via
+      # reflections off buildings and through canopy. 15 is a good starting
+      # point; 20 is aggressive and costs availability in narrow streets.
+      min_elev_deg: 15
+      # C/N0 floor. A reflected signal arrives attenuated, so this is a direct
+      # multipath discriminator. Raise cautiously: under heavy canopy the
+      # direct signals are weak too.
+      min_cno_dbhz: 15
+      # Receiver output filters: clear gnssFixOk on a bad-geometry or
+      # low-accuracy epoch instead of emitting it as though it were sound.
+      #
+      # MEASURED on this hardware: the base receiver reports pDOP 3.33-3.56
+      # while holding hAcc 0.086 m on 32 SVs (verified by hand-parsing the raw
+      # NAV-PVT at payload offset 76, not just trusting the node's own log).
+      # At 4.0 this filter sat only ~0.45 above that baseline, so a nudge under
+      # canopy would have the receiver clear gnssFixOk itself — which surfaces
+      # as a "no fix" drop, NOT as a pDOP drop, and sends you hunting the wrong
+      # knob. 6.0 keeps it as a geometry-collapse backstop with real headroom.
+      outfil_pdop: 6.0
+      outfil_pacc_m: 30
+
+    gate:
+      enable: true
+      require_fix_ok: true
+
+      # --- Tuned for a 3 m/s skid-steer UGV, ZED-X20P with L6/E6 PPP ---
+      #
+      # Measured ~25 cm horizontal in open sky using L6-band corrections
+      # (Galileo E6 HAS / QZSS MADOCA-PPP class service). That is PPP, not RTK,
+      # and the distinction drives this tuning in two ways:
+      #
+      #  1. The corrections arrive on a SATELLITE signal, not over IP. Passing
+      #     under canopy loses the correction stream at the same moment it
+      #     degrades the ranging signals — so accuracy does not decay
+      #     gracefully, it falls back toward standalone.
+      #  2. PPP has a convergence time measured in minutes. After a canopy
+      #     transit the solution must RE-CONVERGE, and position can drift or
+      #     step during that window. Some of what looks like multipath is
+      #     actually re-convergence transient. Filtering cannot remove it;
+      #     only fusion with odometry/IMU rides through it.
+      #
+      # PPP is also more multipath-sensitive than RTK-with-a-local-base, since
+      # there is no nearby reference to difference the error away. The
+      # elevation and C/N0 masks earn their keep more here, not less.
+
+      # Rejects broken epochs while keeping degraded-but-usable fixes when the
+      # PPP solution drops out under trees (expect ~1-2 m there, not 0.25 m).
+      max_hacc_m: 5.0
+      # pDOP is computed from satellite GEOMETRY alone, so it carries almost no
+      # multipath information — a reflected signal sits at the same place in the
+      # sky as the direct one. It is a geometry-collapse backstop, not a
+      # multipath discriminator; hAcc, pACC, the C/N0 and elevation masks and
+      # the jump gate are what actually do that job.
+      #
+      # This base receiver baselines at pDOP 3.33-3.56 (measured). 3.0 was below
+      # the floor of that distribution, so the gate rejected 100% of epochs
+      # (dropped:3407 kept:0) while hAcc was 0.086 m — 23x inside its own limit.
+      # 5.0 leaves ~1.4 of headroom. Re-check under canopy before trusting it.
+      max_pdop: 5.0
+
+      # Implied-speed ceiling between accepted fixes. Above the vehicle's
+      # 3 m/s top speed, not at it — GNSS velocity noise rides on real motion,
+      # and a skid-steer pivot swings the antenna tangentially on top of that.
+      max_jump_speed_mps: 5.0
+
+      # Jump slack is derived from the receiver's own reported hAcc rather than
+      # fixed: margin = clamp(sigma * hAcc, jump_margin_m, jump_margin_max_m).
+      # This is what makes one setting work across both regimes here. Converged
+      # PPP at 0.25 m hAcc gives a 0.75 m margin (1.75 m total allowance at
+      # 5 Hz, against 0.6 m of real travel) — tight enough to catch small
+      # excursions. When PPP drops out under canopy and hAcc honestly rises to
+      # 1.5 m, the margin follows to 3.0 m and legitimate noise is not
+      # rejected as a jump. A fixed margin would have to be set for the worse
+      # case and would sit uselessly loose in open sky.
+      jump_margin_sigma: 3.0
+      jump_margin_m: 0.5        # floor: never tighter than this
+      # Ceiling: multipath inflates hAcc too, so cap how much slack a bad
+      # epoch can buy itself. Keep at or below sigma * max_hacc_m.
+      jump_margin_max_m: 3.0
+
+      # After this many consecutive jump rejections the gate re-anchors and
+      # accepts, so a genuine large correction can never wedge it shut. At
+      # 5 Hz, 25 epochs is ~5 s. This is also what lets a PPP re-convergence
+      # step through rather than stalling position output behind it.
+      max_reject_streak: 25
+
+      # Covariance multipliers by solution type, so a downstream filter
+      # de-weights a degraded fix instead of trusting an optimistic hAcc.
+      #
+      # CHECK THIS ON YOUR HARDWARE: these are keyed on NAV-PVT carrSoln, and
+      # it is not obvious what an L6 PPP solution reports there — it may show
+      # as float (1) or as no carrier solution (0). Read the "CarrSoln:" field
+      # in the node log while converged in open sky. If a converged 25 cm fix
+      # reports 0, it is being inflated 9x here and spp_cov_scale should come
+      # down to ~4.0, or the mapping should key on hAcc instead.
+      float_cov_scale: 4.0    # RTK float
+      spp_cov_scale: 9.0      # standalone / no carrier solution
+      # Applied while the gate is failing open — see max_reject_streak. A fix
+      # published only to avoid a blackout must not be trusted like a normal
+      # one, so this is deliberately large. Used as a floor, never reducing an
+      # already-larger scale.
+      fail_open_cov_scale: 25.0
+
+      # --- Heading path (rover_node only) ---
+      # Heading is INDEPENDENT of the L6 correction service: the moving-base
+      # baseline between your two antennas is computed from the base
+      # receiver's own RTCM over UART2. It stays RTK-fixed-capable even when
+      # PPP has dropped out, which makes heading the most robust GNSS product
+      # on this vehicle under canopy.
+      #
+      # Measured on this vehicle: accHeading averages 0.5 deg when the
+      # moving-base baseline is healthy. Rejecting above 3.0 deg is a 6x
+      # margin over that — wide enough that normal variation and short
+      # RTK-fixed dropouts pass, tight enough that a multipath-corrupted
+      # baseline is caught well before it can swing the vehicle.
+      max_heading_acc_deg: 3.0
+      # Deliberately left false. With a 3.0 deg accuracy gate above, this flag
+      # is largely redundant: a float baseline degraded enough to matter will
+      # breach the accuracy threshold anyway, and accHeading is the better
+      # discriminator because it measures actual quality rather than a binary
+      # solution-type flag. Enabling both would reject a float baseline that
+      # is still reporting sub-degree accuracy, for no gain. A skid steer has
+      # no course-over-ground fallback, so surplus strictness here costs
+      # heading outright.
+      require_rtk_heading: false
+
+    diag:
+      # UBX-NAV-SAT on the base's I2C, for diagnosing WHY pDOP is what it is:
+      # it reports, per satellite, whether it was used in the solution and
+      # whether it actually carried a correction. Use it to test whether this
+      # base's pDOP ~3.5 (against the rover's ~1.1 on the same sky, both
+      # claiming 32 SVs) comes from the precise solution using only the subset
+      # of satellites with L6/E6 corrections available.
+      #
+      # Costs bus bandwidth: ~392 bytes per message at 32 SVs, on a 100 kHz I2C
+      # bus shared with NAV-PVT. nav_sat_rate divides the 5 Hz nav rate, so 5
+      # gives 1 Hz. Turn this OFF again once the question is answered; do not
+      # set nav_sat_rate to 1.
+      nav_sat_enable: false
+      nav_sat_rate: 5

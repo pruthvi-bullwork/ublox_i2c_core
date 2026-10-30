@@ -14,6 +14,11 @@ def generate_launch_description():
         ])
     )
 
+    # Multipath mitigation tuning (receiver CFG-NAVSPG masks + output gate).
+    # Edit config/multipath.yaml to retune without rebuilding.
+    multipath_params = os.path.join(
+        get_package_share_directory('ublox_i2c_core'), 'config', 'multipath.yaml')
+
     return LaunchDescription([
         # NTRIP Client (Fetches from Internet)
         # ntrip_launch,
@@ -22,8 +27,10 @@ def generate_launch_description():
         Node(package='ublox_i2c_core', executable='i2c_manager_node', name='i2c_bridge'),
 
         # Base Node (Publishing /gps/fix)
-        Node(package='ublox_i2c_core', executable='base_node', name='base_gps'),
+        Node(package='ublox_i2c_core', executable='base_node', name='base_gps',
+             parameters=[multipath_params]),
 
         # Rover Node (Publishing /rover/fix and /imu_gps/data)
-        Node(package='ublox_i2c_core', executable='rover_node', name='rover_gps')
+        Node(package='ublox_i2c_core', executable='rover_node', name='rover_gps',
+             parameters=[multipath_params])
     ])

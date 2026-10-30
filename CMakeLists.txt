@@ -30,8 +30,8 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# --- INSTALL LAUNCH FILES ---
-install(DIRECTORY launch
+# --- INSTALL LAUNCH + CONFIG FILES ---
+install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
 

@@ -3,9 +3,12 @@
 #include "ublox_ubx_msgs/msg/ubx_nav_rel_pos_ned.hpp"
 #include "ublox_ubx_msgs/msg/ubx_nav_pvt.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "ublox_i2c_core/ubx_valset.hpp"
+#include "ublox_i2c_core/gnss_gate.hpp"
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <deque>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -31,15 +34,30 @@ public:
             return;
         }
 
+        declare_multipath_params();
+
         send_ubx_set_uart2_baud(460800);
         send_ubx_cfg_rate(40, 5);
         send_ubx_enable_uart1_messages();
+        send_ubx_nav_filter_config();
+
+        // Log the firmware once at startup, then read back what the receiver
+        // actually holds for every key sent above. An ACK only means the frame
+        // was accepted, not that the value took.
+        auto mon_ver = ubx::build_mon_ver_poll();
+        write(serial_fd_, mon_ver.data(), mon_ver.size());
+        usleep(150000);
+        poll_cfg_readback();
 
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&RoverNode::loop, this));
 
         RCLCPP_INFO(get_logger(), "Rover node ready. CFG-RATE meas=40ms nav=5.");
+        RCLCPP_INFO(get_logger(),
+            "Output gate %s: hAcc<=%.1fm pDOP<=%.1f jump<=%.1fm/s. Heading acc limit %.2fdeg.",
+            gate_.params().enable ? "on" : "off", gate_.params().max_hacc_m,
+            gate_.params().max_pdop, gate_.params().max_jump_speed_mps, max_heading_acc_deg_);
     }
 
     ~RoverNode() { if (serial_fd_ >= 0) close(serial_fd_); }
@@ -52,6 +70,26 @@ private:
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavRelPosNED>::SharedPtr relposned_pub_;
     rclcpp::Publisher<ublox_ubx_msgs::msg::UBXNavPVT>::SharedPtr       pvt_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+
+    // Output-side position gate (gate.* parameters).
+    gnss::Gate gate_{gnss::GateParams()};
+
+    // Receiver-side multipath masks (nav_filter.* parameters).
+    bool   nav_filter_enable_ = true;
+    int    dyn_model_         = 3;
+    int    min_elev_deg_      = 15;
+    int    min_cno_dbhz_      = 15;
+    double outfil_pdop_       = 4.0;
+    int    outfil_pacc_m_     = 30;
+
+    // Heading path (gate.max_heading_acc_deg / gate.require_rtk_heading).
+    double max_heading_acc_deg_ = 5.0;
+    bool   require_rtk_heading_ = false;
+
+    // Labels of frames awaiting UBX-ACK, in send order: CFG-VALSET and
+    // CFG-VALGET are ACKed separately, so each gets its own FIFO.
+    std::deque<std::string> pending_valset_;
+    std::deque<std::string> pending_valget_;
 
     bool init_serial(const std::string& port, int baud) {
         (void)baud;
@@ -88,6 +126,7 @@ private:
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
         msg.push_back(cka); msg.push_back(ckb);
         write(serial_fd_, msg.data(), msg.size());
+        pending_valset_.push_back("CFG-UART2-BAUDRATE");
         usleep(150000);
     }
 
@@ -112,6 +151,7 @@ private:
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
         msg.push_back(cka); msg.push_back(ckb);
         write(serial_fd_, msg.data(), msg.size());
+        pending_valset_.push_back("CFG-RATE-MEAS/NAV");
         usleep(150000);
     }
 
@@ -139,7 +179,170 @@ private:
         for (size_t i = 2; i < msg.size(); i++) { cka += msg[i]; ckb += cka; }
         msg.push_back(cka); msg.push_back(ckb);
         write(serial_fd_, msg.data(), msg.size());
+        pending_valset_.push_back("CFG-MSGOUT-UART1 PVT+RELPOSNED");
         usleep(150000);
+    }
+
+    // Multipath parameters (config/multipath.yaml); the gate.*heading* keys are rover-only.
+    void declare_multipath_params() {
+        nav_filter_enable_ = declare_parameter("nav_filter.enable", true);
+        dyn_model_         = declare_parameter("nav_filter.dyn_model", 3);
+        min_elev_deg_      = declare_parameter("nav_filter.min_elev_deg", 15);
+        min_cno_dbhz_      = declare_parameter("nav_filter.min_cno_dbhz", 15);
+        outfil_pdop_       = declare_parameter("nav_filter.outfil_pdop", 4.0);
+        outfil_pacc_m_     = declare_parameter("nav_filter.outfil_pacc_m", 30);
+
+        max_heading_acc_deg_ = declare_parameter("gate.max_heading_acc_deg", 5.0);
+        require_rtk_heading_ = declare_parameter("gate.require_rtk_heading", false);
+
+        gnss::GateParams gp{};
+        gp.enable              = declare_parameter("gate.enable", true);
+        gp.require_fix_ok      = declare_parameter("gate.require_fix_ok", true);
+        gp.max_hacc_m          = declare_parameter("gate.max_hacc_m", 5.0);
+        gp.max_pdop            = declare_parameter("gate.max_pdop", 4.0);
+        gp.max_jump_speed_mps  = declare_parameter("gate.max_jump_speed_mps", 15.0);
+        gp.jump_margin_sigma   = declare_parameter("gate.jump_margin_sigma", 3.0);
+        gp.jump_margin_m       = declare_parameter("gate.jump_margin_m", 0.5);
+        gp.jump_margin_max_m   = declare_parameter("gate.jump_margin_max_m", 5.0);
+        gp.max_reject_streak   = declare_parameter("gate.max_reject_streak", 25);
+        gp.float_cov_scale     = declare_parameter("gate.float_cov_scale", 4.0);
+        gp.spp_cov_scale       = declare_parameter("gate.spp_cov_scale", 9.0);
+        gp.fail_open_cov_scale = declare_parameter("gate.fail_open_cov_scale", 25.0);
+        gate_.set_params(gp);
+    }
+
+    // One key per CFG-VALSET (RAM layer), so a NAK pins down exactly which key was refused.
+    void apply_cfg_key(const char* label, uint32_t key, uint64_t value) {
+        auto frame = ubx::build_valset({{key, value}}, ubx::LAYER_RAM);
+        write(serial_fd_, frame.data(), frame.size());
+        pending_valset_.push_back(label);
+        usleep(150000);
+    }
+
+    // UBX-CFG-NAVSPG multipath masks, from the nav_filter.* parameters.
+    void send_ubx_nav_filter_config() {
+        if (!nav_filter_enable_) {
+            RCLCPP_WARN(get_logger(), "nav_filter.enable=false - receiver multipath masks NOT applied.");
+            return;
+        }
+        apply_cfg_key("CFG-NAVSPG-DYNMODEL",      ubx::CFG_NAVSPG_DYNMODEL,      (uint8_t)dyn_model_);
+        apply_cfg_key("CFG-NAVSPG-INFIL_MINELEV", ubx::CFG_NAVSPG_INFIL_MINELEV, (uint8_t)min_elev_deg_);
+        apply_cfg_key("CFG-NAVSPG-INFIL_MINCNO",  ubx::CFG_NAVSPG_INFIL_MINCNO,  (uint8_t)min_cno_dbhz_);
+        apply_cfg_key("CFG-NAVSPG-OUTFIL_PDOP",   ubx::CFG_NAVSPG_OUTFIL_PDOP,   (uint16_t)(outfil_pdop_ * 10.0));
+        apply_cfg_key("CFG-NAVSPG-OUTFIL_PACC",   ubx::CFG_NAVSPG_OUTFIL_PACC,   (uint16_t)outfil_pacc_m_);
+
+        RCLCPP_INFO(get_logger(),
+            "Nav filter sent: dynModel=%d minElev=%ddeg minCNO=%ddBHz outPDOP=%.1f outPACC=%dm. Watch for ACK/NAK.",
+            dyn_model_, min_elev_deg_, min_cno_dbhz_, outfil_pdop_, outfil_pacc_m_);
+    }
+
+    // UBX-CFG-VALGET (0x06 0x8B), RAM layer, one key per poll so each answer and each
+    // ACK/NAK can be attributed. Replies are decoded by handle_valget().
+    //
+    // This is the only way to confirm a key actually took: the receiver ACKs a
+    // VALSET it parsed even when it then keeps the old value.
+    void poll_cfg_readback() {
+        static const uint32_t kKeys[] = {
+            ubx::CFG_NAVSPG_DYNMODEL,
+            ubx::CFG_NAVSPG_INFIL_MINELEV,
+            ubx::CFG_NAVSPG_INFIL_MINCNO,
+            ubx::CFG_NAVSPG_OUTFIL_PDOP,
+            ubx::CFG_NAVSPG_OUTFIL_PACC,
+        };
+        for (uint32_t key : kKeys) {
+            auto frame = ubx::build_valget({key}, ubx::VALGET_RAM);
+            write(serial_fd_, frame.data(), frame.size());
+            pending_valget_.push_back(ubx::key_name(key));
+            usleep(100000);
+        }
+    }
+
+    // UBX-CFG-VALGET response: version, layer, position[2], then key/value pairs.
+    // Each value's width comes from the key's size field (ubx::key_value_size);
+    // an unknown size ends the walk, since the next key's offset is then unknown.
+    void handle_valget(size_t idx, uint16_t len) {
+        if (len < 4) return;
+        const size_t P = idx + 6;
+        const uint8_t layer = buffer_[P + 1];
+
+        // Key/value pairs start after the 4-byte header.
+        size_t off = 4;
+        while (off + 4 <= len) {
+            const uint32_t key = buffer_[P + off] | (buffer_[P + off + 1] << 8) |
+                                 (buffer_[P + off + 2] << 16) | (buffer_[P + off + 3] << 24);
+            const size_t size = ubx::key_value_size(key);
+            if (size == 0 || off + size + 4 > len) break;
+
+            uint64_t value = 0;
+            for (size_t i = 0; i < size; i++)
+                value |= (uint64_t)buffer_[P + off + i + 4] << (8 * i);
+            off += size + 4;
+
+            const char* name  = ubx::key_name(key);
+            const char* lname = ubx::layer_name(layer);
+            if (key == ubx::CFG_NAVSPG_DYNMODEL) {
+                RCLCPP_INFO(get_logger(), "CFG readback | %s [%s] = %u (%s)",
+                    name, lname, (unsigned)value, ubx::dyn_model_name((uint8_t)value));
+            } else if (key == ubx::CFG_NAVSPG_INFIL_MINELEV) {
+                RCLCPP_INFO(get_logger(), "CFG readback | %s [%s] = %d deg",
+                    name, lname, (int)(int8_t)value);
+            } else if (key == ubx::CFG_NAVSPG_INFIL_MINCNO) {
+                RCLCPP_INFO(get_logger(), "CFG readback | %s [%s] = %u dBHz",
+                    name, lname, (unsigned)value);
+            } else if (key == ubx::CFG_NAVSPG_OUTFIL_PDOP) {
+                RCLCPP_INFO(get_logger(), "CFG readback | %s [%s] = %.1f",
+                    name, lname, value / 10.0);
+            } else if (key == ubx::CFG_NAVSPG_OUTFIL_PACC) {
+                RCLCPP_INFO(get_logger(), "CFG readback | %s [%s] = %u m",
+                    name, lname, (unsigned)value);
+            } else {
+                RCLCPP_INFO(get_logger(), "CFG readback | key 0x%08X [%s] = %llu",
+                    key, lname, (unsigned long long)value);
+            }
+        }
+    }
+
+    // UBX-MON-VER: swVersion[30], hwVersion[10], then extension[30] repeated.
+    void handle_mon_ver(size_t idx, uint16_t len) {
+        const size_t P = idx + 6;
+        if (len < 40) return;
+        auto field = [this, &P](size_t off, size_t max) {
+            std::string s;
+            for (size_t k = 0; k < max && buffer_[P + off + k] != 0; k++)
+                s += (char)buffer_[P + off + k];
+            return s;
+        };
+        RCLCPP_INFO(get_logger(), "MON-VER | sw=%s hw=%s", field(0, 30).c_str(), field(30, 10).c_str());
+        for (size_t off = 40; off + 30 <= len; off += 30) {
+            const std::string ext = field(off, 30);
+            if (!ext.empty())
+                RCLCPP_INFO(get_logger(), "MON-VER | ext: %s", ext.c_str());
+        }
+    }
+
+    // UBX-ACK-ACK / UBX-ACK-NAK (0x05 0x01 / 0x05 0x00), payload = class/id of the frame.
+    // The receiver answers in order, so the oldest pending label for that type is this one.
+    void handle_ack(size_t idx, bool ack) {
+        const uint8_t cls = buffer_[idx + 6];
+        const uint8_t id  = buffer_[idx + 7];
+
+        std::string label = "?";
+        if (cls == 0x06 && id == 0x8A && !pending_valset_.empty()) {
+            // CFG-VALSET
+            label = pending_valset_.front();
+            pending_valset_.pop_front();
+        } else if (cls == 0x06 && id == 0x8B && !pending_valget_.empty()) {
+            // CFG-VALGET (the poll itself; the data arrives separately)
+            label = std::string("readback ") + pending_valget_.front();
+            pending_valget_.pop_front();
+        }
+
+        // An ACK only means the frame was accepted. Whether the value took is
+        // confirmed by the CFG readback lines, not here.
+        if (ack)
+            RCLCPP_INFO(get_logger(), "UBX-ACK-ACK  cls=0x%02X id=0x%02X (%s)", cls, id, label.c_str());
+        else
+            RCLCPP_ERROR(get_logger(), "UBX-ACK-NAK  cls=0x%02X id=0x%02X (%s) - key rejected, mask NOT applied", cls, id, label.c_str());
     }
 
     bool verify_ubx_checksum(size_t start, uint16_t len) {
@@ -165,6 +368,10 @@ private:
                     if (verify_ubx_checksum(i, len)) {
                         if      (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x07) handle_pvt(i);
                         else if (buffer_[i+2] == 0x01 && buffer_[i+3] == 0x3C) handle_relposned(i);
+                        else if (buffer_[i+2] == 0x05 && (buffer_[i+3] == 0x00 || buffer_[i+3] == 0x01))
+                            handle_ack(i, buffer_[i+3] == 0x01);
+                        else if (buffer_[i+2] == 0x06 && buffer_[i+3] == 0x8B) handle_valget(i, len);
+                        else if (buffer_[i+2] == 0x0A && buffer_[i+3] == 0x04) handle_mon_ver(i, len);
                         i += total; continue;
                     }
                 } else break;
@@ -245,11 +452,28 @@ private:
         double acc_len_m   = accLength * 0.0001;
         double acc_hdg_deg = accHeading * 1e-5;
 
-        if (relPosHeadingValid) {
+        // Heading gate. accHeading is the primary discriminator (gate.max_heading_acc_deg,
+        // <= 0 disables): it measures actual baseline quality, where carrSoln is only a
+        // binary solution-type flag. RTK-fixed is therefore only required when
+        // gate.require_rtk_heading is set. A baseline whose reference position or
+        // observations are missing is never trusted, whatever its reported accuracy.
+        //
+        // Heading is independent of the L6 correction service (moving-base RTCM over
+        // UART2), so it can stay healthy while the PPP position has dropped out.
+        bool hdg_acc_ok = max_heading_acc_deg_ <= 0.0 || acc_hdg_deg <= max_heading_acc_deg_;
+        bool hdg_rtk_ok = !require_rtk_heading_ || carrSolnRaw == 2;
+        bool hdg_ref_ok = !refPosMiss && !refObsMiss;
+
+        if (relPosHeadingValid && relPosValid && hdg_acc_ok && hdg_rtk_ok && hdg_ref_ok) {
             relposned_pub_->publish(msg);
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                 "HEADING | Yaw: %06.2f deg (acc: %.4f deg) | Length: %.3fm (acc: %.4fm) | RTK: %d",
                 heading_deg, acc_hdg_deg, length_m, acc_len_m, carrSolnRaw);
+        } else if (relPosHeadingValid) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "HEADING DROPPED | acc:%.3fdeg (limit %.3f) relPosValid:%d RTK:%d refPosMiss:%d refObsMiss:%d",
+                acc_hdg_deg, max_heading_acc_deg_, relPosValid, carrSolnRaw,
+                refPosMiss, refObsMiss);
         } else {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                 "HARDWARE HEADING | DROPPED (Waiting for Base RTCM on UART2)");
@@ -311,6 +535,21 @@ private:
 
         float hAcc_m = hAcc_raw / 1000.0f;
         float vAcc_m = vAcc_raw / 1000.0f;
+        double pdop  = pDOP * 0.01;
+
+        // Output gate: decide whether this fix is published, and how far its
+        // covariance is inflated, before the NavSatFix is built.
+        gnss::GateInput gin{};
+        gin.lat_deg   = lat_raw * 1e-7;
+        gin.lon_deg   = lon_raw * 1e-7;
+        gin.t_sec     = now().seconds();
+        gin.fix_ok    = gnssFixOk;
+        gin.hacc_m    = hAcc_m;
+        gin.pdop      = pdop;
+        gin.carr_soln = carrSolnRaw;
+        gin.num_sv    = numSV;
+        gnss::Verdict verdict = gate_.check(gin);
+        double cov_scale = gate_.cov_scale(carrSolnRaw);
 
         // NavSatFix
         sensor_msgs::msg::NavSatFix fix;
@@ -319,15 +558,40 @@ private:
         fix.latitude   = lat_raw * 1e-7;
         fix.longitude  = lon_raw * 1e-7;
         fix.altitude   = hMSL / 1000.0;
-        fix.position_covariance[0] = hAcc_m * hAcc_m;
-        fix.position_covariance[4] = hAcc_m * hAcc_m;
-        fix.position_covariance[8] = vAcc_m * vAcc_m;
+        fix.position_covariance[0] = hAcc_m * hAcc_m * cov_scale;
+        fix.position_covariance[4] = hAcc_m * hAcc_m * cov_scale;
+        fix.position_covariance[8] = vAcc_m * vAcc_m * cov_scale;
         fix.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
         if      (carrSolnRaw == 2) fix.status.status = 2;
         else if (carrSolnRaw == 1) fix.status.status = 1;
         else if (fixType     >= 3) fix.status.status = 0;
         else                       fix.status.status = -1;
-        fix_pub_->publish(fix);
+
+        if (gnss::accepted(verdict)) {
+            if (verdict == gnss::Verdict::ReAnchor) {
+                RCLCPP_WARN(get_logger(),
+                    "ROVER gate RE-ANCHORED after %d consecutive jump rejections (last jump %.2fm) - position discontinuity is being passed through deliberately.",
+                    gate_.params().max_reject_streak, gate_.last_jump_m());
+            }
+            // Failing open: every epoch was breaching hAcc/pDOP for longer than
+            // max_reject_streak. Publish rather than black out, but with the
+            // covariance floored at fail_open_cov_scale, and say so loudly -
+            // this means a threshold is set below the receiver's baseline.
+            if (verdict == gnss::Verdict::FailOpen) {
+                RCLCPP_ERROR(get_logger(),
+                    "ROVER gate FAILING OPEN after %d consecutive threshold rejections | hAcc:%.2fm (limit %.2f) pDOP:%.2f (limit %.2f) | publishing with covariance x%.0f. A threshold is below this receiver's baseline - retune gate.max_hacc_m / gate.max_pdop.",
+                    gate_.params().max_reject_streak, hAcc_m, gate_.params().max_hacc_m,
+                    pdop, gate_.params().max_pdop, gate_.params().fail_open_cov_scale);
+            }
+
+            fix_pub_->publish(fix);
+        } else {
+            // Dropped: nothing is published on /rover/fix for this epoch.
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "ROVER fix DROPPED (%s) | hAcc:%.2fm pDOP:%.2f sats:%u jump:%.2fm allowed-margin:%.2fm | dropped:%lu kept:%lu",
+                gnss::verdict_str(verdict), hAcc_m, pdop, numSV, gate_.last_jump_m(),
+                gate_.last_margin_m(), gate_.rejected_total(), gate_.accepted_total());
+        }
 
         // UBXNavPVT — mapped to exact field names from message definition
         auto pvt = ublox_ubx_msgs::msg::UBXNavPVT();
@@ -378,8 +642,9 @@ private:
         pvt_pub_->publish(pvt);
 
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-            "ROVER PVT | Fix:%u CarrSoln:%u Sats:%u Acc:%.3fm Speed:%.3fm/s HeadVeh:%.2fdeg",
-            fixType, carrSolnRaw, numSV, hAcc_m, gSpeed / 1000.0f, headVeh * 1e-5);
+            "ROVER PVT | Fix:%u CarrSoln:%u Sats:%u Acc:%.3fm pDOP:%.2f Speed:%.3fm/s HeadVeh:%.2fdeg | gate:%s",
+            fixType, carrSolnRaw, numSV, hAcc_m, pdop, gSpeed / 1000.0f, headVeh * 1e-5,
+            gnss::verdict_str(verdict));
     }
 };
 
